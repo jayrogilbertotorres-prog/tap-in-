@@ -23,6 +23,7 @@ analysis_slots = threading.BoundedSemaphore(2)
 DAILY_REVIEWS = max(1, int(os.getenv('TAPIN_DAILY_REVIEWS', '5')))
 GLOBAL_DAILY_REVIEWS = max(1, int(os.getenv('TAPIN_GLOBAL_DAILY_REVIEWS', '30')))
 MAX_USER_CLIPS = 10
+MAX_TOTAL_CLIPS = max(1, int(os.getenv('TAPIN_MAX_TOTAL_CLIPS', '40')))
 app = FastAPI(title='TapIn AI Coaching')
 
 def connect():
@@ -44,6 +45,13 @@ async def protect_writes(request: Request, call_next):
     if request.method in ('POST', 'DELETE', 'PUT', 'PATCH') and request.headers.get('x-tapin-request') != '1':
         from fastapi.responses import JSONResponse
         return JSONResponse({'detail': 'Invalid request origin'}, status_code=403)
+    if request.method == 'POST':
+        from fastapi.responses import JSONResponse
+        limit = MAX_BYTES + 1024 * 1024 if request.url.path == '/api/clips' else 64 * 1024
+        try: length = int(request.headers.get('content-length', '-1'))
+        except ValueError: return JSONResponse({'detail': 'Invalid content length'}, status_code=400)
+        if length < 0: return JSONResponse({'detail': 'Content length required'}, status_code=411)
+        if length > limit: return JSONResponse({'detail': 'Request too large'}, status_code=413)
     response = await call_next(request)
     if request.url.path.startswith('/api/'): response.headers['Cache-Control'] = 'no-store'
     return response
@@ -113,7 +121,7 @@ def login(body: Credentials, request: Request, response: Response):
 def logout(request: Request, response: Response):
     token = request.cookies.get(COOKIE, '')
     with connect() as db: db.execute('DELETE FROM sessions WHERE token=?', (hashlib.sha256(token.encode()).hexdigest(),))
-    response.delete_cookie(COOKIE)
+    response.delete_cookie(COOKIE, httponly=True, secure=os.getenv('TAPIN_COOKIE_SECURE', '1') != '0', samesite='strict')
     return {'ok': True}
 
 @app.get('/')
@@ -156,6 +164,8 @@ async def upload_clip(video: UploadFile=File(...), user=Depends(current_user)):
             db.execute('BEGIN IMMEDIATE')
             if db.execute('SELECT COUNT(*) FROM clips WHERE user_id=?', (user['id'],)).fetchone()[0] >= MAX_USER_CLIPS:
                 raise HTTPException(429, 'Clip storage limit reached. Delete an old clip first.')
+            if db.execute('SELECT COUNT(*) FROM clips').fetchone()[0] >= MAX_TOTAL_CLIPS:
+                raise HTTPException(429, 'Server clip storage capacity reached.')
             db.execute('INSERT INTO clips VALUES (?,?,?,?,?,NULL)', (cid, user['id'], Path(video.filename).name[:200], stored, time.time()))
     except BaseException:
         path.unlink(missing_ok=True)
@@ -171,7 +181,9 @@ def owned_clip(cid, user):
 @app.get('/api/clips/{cid}/video')
 def clip_video(cid: str, user=Depends(current_user)):
     row = owned_clip(cid, user)
-    return FileResponse(CLIPS / row['stored'], headers={'Cache-Control': 'private, no-store'})
+    path = CLIPS / row['stored']
+    if not path.is_file(): raise HTTPException(404, 'Clip file unavailable.')
+    return FileResponse(path, headers={'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff'})
 
 @app.delete('/api/clips/{cid}')
 def delete_clip(cid: str, user=Depends(current_user)):
@@ -184,9 +196,10 @@ def frames_from_video(filename):
     capture=cv2.VideoCapture(filename)
     if not capture.isOpened():
         raise HTTPException(422, 'Video cannot be decoded. Please upload a supported MP4 or WebM clip.')
-    fps=capture.get(cv2.CAP_PROP_FPS) or 30
+    fps=capture.get(cv2.CAP_PROP_FPS)
+    if not math.isfinite(fps) or fps <= 0: fps=30
     count=capture.get(cv2.CAP_PROP_FRAME_COUNT)
-    seconds=min(120.0,count/fps if count>0 else 120.0)
+    seconds=min(120.0,max(0.0,(count-1)/fps) if math.isfinite(count) and count>0 else 120.0)
     # Analyze up to 12 evenly spread frames in the first two minutes.
     samples=min(12,max(2,int(seconds/5)+1))
     frames=[]
@@ -239,7 +252,7 @@ def run_analysis(cid, focus, user, row):
         response=OpenAI(timeout=65, max_retries=0).responses.create(model=os.getenv('TAPIN_MODEL','gpt-4.1-mini'),input=[{'role':'user','content':content}],max_output_tokens=1100,store=False)
     except Exception:
         raise HTTPException(502, 'AI provider request failed. Please retry later.')
-    raw=response.output_text.strip()
+    raw=(response.output_text or '').strip()
     raw=re.sub(r'^```(?:json)?\s*|\s*```$','',raw)
     try: result=json.loads(raw)
     except json.JSONDecodeError: result={'analysis':raw,'markers':[]}
