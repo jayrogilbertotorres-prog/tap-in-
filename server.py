@@ -19,6 +19,10 @@ COOKIE = 'tapin_session'
 SESSION_AGE = 30 * 24 * 3600
 MAX_BYTES = 250 * 1024 * 1024
 lock = threading.Lock()
+analysis_slots = threading.BoundedSemaphore(2)
+DAILY_REVIEWS = max(1, int(os.getenv('TAPIN_DAILY_REVIEWS', '5')))
+GLOBAL_DAILY_REVIEWS = max(1, int(os.getenv('TAPIN_GLOBAL_DAILY_REVIEWS', '30')))
+MAX_USER_CLIPS = 10
 app = FastAPI(title='TapIn AI Coaching')
 
 def connect():
@@ -26,6 +30,8 @@ def connect():
     con.row_factory = sqlite3.Row
     con.execute('PRAGMA foreign_keys=ON')
     con.executescript("""
+    CREATE TABLE IF NOT EXISTS analysis_attempts (user_id TEXT NOT NULL, created REAL NOT NULL);
+    CREATE INDEX IF NOT EXISTS attempts_created ON analysis_attempts(created);
     CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, salt TEXT NOT NULL, password TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), expires REAL NOT NULL);
     CREATE TABLE IF NOT EXISTS clips (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), filename TEXT NOT NULL, stored TEXT NOT NULL, created REAL NOT NULL, review TEXT);
@@ -124,6 +130,10 @@ def profile(user=Depends(current_user)):
 
 @app.post('/api/clips')
 async def upload_clip(video: UploadFile=File(...), user=Depends(current_user)):
+    with connect() as db:
+        if db.execute('SELECT COUNT(*) FROM clips WHERE user_id=?', (user['id'],)).fetchone()[0] >= MAX_USER_CLIPS:
+            await video.close()
+            raise HTTPException(429, 'Clip storage limit reached. Delete an old clip first.')
     suffix = Path(video.filename or '').suffix.lower()
     if suffix not in ('.mp4', '.webm', '.mov', '.m4v'): raise HTTPException(415, 'Please use an MP4, WebM, or MOV video.')
     cid = secrets.token_hex(16)
@@ -137,7 +147,15 @@ async def upload_clip(video: UploadFile=File(...), user=Depends(current_user)):
                 if size > MAX_BYTES: raise HTTPException(413, 'Clip exceeds 250 MB limit.')
                 target.write(chunk)
         if size == 0: raise HTTPException(422, 'Clip is empty.')
+        cap = cv2.VideoCapture(str(path))
+        try:
+            ok, frame = cap.read()
+            if not ok or frame is None: raise HTTPException(422, 'Video cannot be decoded.')
+        finally: cap.release()
         with connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if db.execute('SELECT COUNT(*) FROM clips WHERE user_id=?', (user['id'],)).fetchone()[0] >= MAX_USER_CLIPS:
+                raise HTTPException(429, 'Clip storage limit reached. Delete an old clip first.')
             db.execute('INSERT INTO clips VALUES (?,?,?,?,?,NULL)', (cid, user['id'], Path(video.filename).name[:200], stored, time.time()))
     except BaseException:
         path.unlink(missing_ok=True)
@@ -188,6 +206,20 @@ def frames_from_video(filename):
 @app.post('/api/clips/{cid}/analyze')
 def analyze(cid: str, focus: str=Form('Gameplay decisions'), user=Depends(current_user)):
     row = owned_clip(cid, user)
+    if not os.getenv('OPENAI_API_KEY'): raise HTTPException(503, 'AI service not connected.')
+    if not analysis_slots.acquire(blocking=False): raise HTTPException(429, 'Coach is busy. Try again shortly.')
+    try:
+        with connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            cutoff = time.time() - 86400
+            db.execute('DELETE FROM analysis_attempts WHERE created < ?', (cutoff,))
+            if db.execute('SELECT COUNT(*) FROM analysis_attempts WHERE user_id=?', (user['id'],)).fetchone()[0] >= DAILY_REVIEWS or db.execute('SELECT COUNT(*) FROM analysis_attempts').fetchone()[0] >= GLOBAL_DAILY_REVIEWS:
+                raise HTTPException(429, 'Free coaching daily capacity reached. Try again later.')
+            db.execute('INSERT INTO analysis_attempts VALUES (?,?)', (user['id'], time.time()))
+        return run_analysis(cid, focus, user, row)
+    finally: analysis_slots.release()
+
+def run_analysis(cid, focus, user, row):
     if not os.getenv('OPENAI_API_KEY'): raise HTTPException(503,'AI service not connected. Set OPENAI_API_KEY on the server.')
     frames=frames_from_video(str(CLIPS / row['stored']))
     content=[{'type':'input_text','text':(
@@ -203,7 +235,10 @@ def analyze(cid: str, focus: str=Form('Gameplay decisions'), user=Depends(curren
     for t,b64 in frames:
         content.append({'type':'input_text','text':f'Frame at {t:.1f} seconds'})
         content.append({'type':'input_image','image_url':'data:image/jpeg;base64,'+b64,'detail':'low'})
-    response=OpenAI(timeout=65, max_retries=0).responses.create(model=os.getenv('TAPIN_MODEL','gpt-4.1-mini'),input=[{'role':'user','content':content}],max_output_tokens=1100,store=False)
+    try:
+        response=OpenAI(timeout=65, max_retries=0).responses.create(model=os.getenv('TAPIN_MODEL','gpt-4.1-mini'),input=[{'role':'user','content':content}],max_output_tokens=1100,store=False)
+    except Exception:
+        raise HTTPException(502, 'AI provider request failed. Please retry later.')
     raw=response.output_text.strip()
     raw=re.sub(r'^```(?:json)?\s*|\s*```$','',raw)
     try: result=json.loads(raw)
