@@ -9,7 +9,7 @@ from openai import OpenAI
 
 BASE = Path(__file__).resolve().parent
 DB = Path(os.getenv('TAPIN_DB', str(BASE / 'reviews.sqlite3')))
-MAX_BYTES = 50 * 1024 * 1024
+MAX_BYTES = 250 * 1024 * 1024
 LIMIT = 5
 lock = threading.Lock()
 app = FastAPI(title='TapIn AI Coaching')
@@ -73,7 +73,7 @@ async def analyze(video: UploadFile=File(...), focus: str=Form('Gameplay decisio
         size=0
         while chunk:=await video.read(1024*1024):
             size+=len(chunk)
-            if size>MAX_BYTES: raise HTTPException(413,'Clip exceeds 50 MB limit.')
+            if size>MAX_BYTES: raise HTTPException(413,'Clip exceeds 250 MB limit.')
             tmp.write(chunk)
         tmp.close()
         frames=frames_from_video(tmp.name)
