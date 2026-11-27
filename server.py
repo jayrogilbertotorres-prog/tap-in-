@@ -1,6 +1,8 @@
 """TapIn account-based gameplay coaching prototype. Run behind HTTPS in production."""
 import base64, json, os, re, sqlite3, tempfile, threading
 import hashlib, hmac, secrets, time, math
+from urllib.parse import urlparse
+from contextlib import closing
 from fastapi import Request, Response, Depends
 from pydantic import BaseModel
 from pathlib import Path
@@ -31,6 +33,10 @@ def connect():
     con.row_factory = sqlite3.Row
     con.execute('PRAGMA foreign_keys=ON')
     con.executescript("""
+    CREATE TABLE IF NOT EXISTS visits (day TEXT NOT NULL, visitor TEXT NOT NULL, views INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(day,visitor));
+    CREATE TABLE IF NOT EXISTS chat_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, username TEXT NOT NULL, message TEXT NOT NULL, created REAL NOT NULL, hidden INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS chat_bans (user_id TEXT PRIMARY KEY);
+    CREATE TABLE IF NOT EXISTS chat_reports (message_id INTEGER NOT NULL, reporter TEXT NOT NULL, PRIMARY KEY(message_id,reporter));
     CREATE TABLE IF NOT EXISTS analysis_attempts (user_id TEXT NOT NULL, created REAL NOT NULL);
     CREATE INDEX IF NOT EXISTS attempts_created ON analysis_attempts(created);
     CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, salt TEXT NOT NULL, password TEXT NOT NULL);
@@ -134,7 +140,7 @@ def status(): return {'ready': bool(os.getenv('OPENAI_API_KEY'))}
 def profile(user=Depends(current_user)):
     with connect() as db:
         rows = db.execute('SELECT id, filename, created, review FROM clips WHERE user_id=? ORDER BY created DESC', (user['id'],)).fetchall()
-    return {'username': user['username'], 'clips': [dict(r) | {'review': json.loads(r['review']) if r['review'] else None} for r in rows]}
+    return {'username': user['username'], 'account_id': user['id'], 'is_owner': bool(os.getenv('TAPIN_OWNER_USER_ID')) and user['id']==os.getenv('TAPIN_OWNER_USER_ID'), 'clips': [dict(r) | {'review': json.loads(r['review']) if r['review'] else None} for r in rows]}
 
 @app.post('/api/clips')
 async def upload_clip(video: UploadFile=File(...), user=Depends(current_user)):
@@ -268,3 +274,112 @@ def run_analysis(cid, focus, user, row):
     with connect() as db:
         db.execute('UPDATE clips SET review=? WHERE id=? AND user_id=?', (json.dumps(result), cid, user['id']))
     return result
+
+# Community features: no payments or native video transport are handled here.
+def owner(user):
+    configured = os.getenv('TAPIN_OWNER_USER_ID', '').strip()
+    if not configured or not hmac.compare_digest(user['id'],configured):
+        raise HTTPException(403, 'Owner access required.')
+    return user
+
+def trusted_link(value, allowed):
+    try:
+        p = urlparse(value)
+        return value if p.scheme == 'https' and p.hostname in allowed and not p.username and not p.password and p.port in (None,443) else ''
+    except ValueError:
+        return ''
+
+@app.get('/api/community')
+def community():
+    streams = []
+    try: configured = json.loads(os.getenv('TAPIN_STREAMS_JSON','[]'))
+    except ValueError: configured = []
+    for item in configured[:20] if isinstance(configured,list) else []:
+        if not isinstance(item,dict): continue
+        url = trusted_link(str(item.get('url','')), {'twitch.tv','www.twitch.tv','youtube.com','www.youtube.com','youtu.be','kick.com','www.kick.com'})
+        if url: streams.append({'name':str(item.get('name','Stream'))[:80],'url':url})
+    donation = trusted_link(os.getenv('TAPIN_DONATION_URL',''), {'cash.app','www.paypal.com','paypal.me','buymeacoffee.com','www.buymeacoffee.com','ko-fi.com'})
+    return {'streams':streams,'donation_url':donation,'donation_recipient':os.getenv('TAPIN_DONATION_RECIPIENT','')[:100] if donation else ''}
+
+@app.get('/api/chat')
+def chat():
+    with closing(connect()) as db:
+        rows = db.execute('SELECT id,username,message,created FROM chat_messages WHERE hidden=0 AND created>? ORDER BY id DESC LIMIT 60',(time.time()-86400*7,)).fetchall()
+    return {'messages':[dict(r) for r in reversed(rows)]}
+
+class ChatMessage(BaseModel):
+    message: str
+
+@app.post('/api/chat')
+def send_chat(body: ChatMessage, user=Depends(current_user)):
+    message = body.message.strip()
+    if not 1 <= len(message) <= 180: raise HTTPException(422,'Use 1–180 characters.')
+    with closing(connect()) as db, db:
+        db.execute('BEGIN IMMEDIATE')
+        if db.execute('SELECT 1 FROM chat_bans WHERE user_id=?',(user['id'],)).fetchone(): raise HTTPException(403,'Chat access suspended.')
+        if db.execute('SELECT COUNT(*) FROM chat_messages WHERE user_id=? AND created>?',(user['id'],time.time()-10)).fetchone()[0]>=3: raise HTTPException(429,'Slow down.')
+        db.execute('INSERT INTO chat_messages(user_id,username,message,created) VALUES (?,?,?,?)',(user['id'],user['username'],message,time.time()))
+        db.execute('DELETE FROM chat_reports WHERE message_id IN (SELECT id FROM chat_messages WHERE created<?)',(time.time()-86400*7,))
+        db.execute('DELETE FROM chat_messages WHERE created<?',(time.time()-86400*7,))
+    return {'ok':True}
+
+@app.post('/api/chat/{mid}/report')
+def report_chat(mid:int,user=Depends(current_user)):
+    with closing(connect()) as db, db:
+        if not db.execute('SELECT 1 FROM chat_messages WHERE id=? AND hidden=0',(mid,)).fetchone(): raise HTTPException(404,'Message unavailable.')
+        db.execute('INSERT OR IGNORE INTO chat_reports VALUES (?,?)',(mid,user['id']))
+    return {'ok':True}
+
+@app.get('/api/admin/chat')
+def admin_chat(user=Depends(current_user)):
+    owner(user)
+    with closing(connect()) as db:
+        rows=db.execute('SELECT m.id,m.username,m.message,m.hidden,COUNT(r.reporter) AS reports FROM chat_messages m LEFT JOIN chat_reports r ON r.message_id=m.id GROUP BY m.id ORDER BY reports DESC,m.id DESC LIMIT 100').fetchall()
+    return {'messages':[dict(r) for r in rows]}
+
+@app.delete('/api/admin/chat/{mid}')
+def hide_chat(mid:int,user=Depends(current_user)):
+    owner(user)
+    with closing(connect()) as db,db: db.execute('UPDATE chat_messages SET hidden=1 WHERE id=?',(mid,))
+    return {'ok':True}
+
+@app.post('/api/admin/chat/{mid}/ban')
+def ban_chat(mid:int,user=Depends(current_user)):
+    owner(user)
+    with closing(connect()) as db,db:
+        row=db.execute('SELECT user_id FROM chat_messages WHERE id=?',(mid,)).fetchone()
+        if not row: raise HTTPException(404,'Message unavailable.')
+        if row['user_id']==user['id']: raise HTTPException(400,'Cannot ban yourself.')
+        db.execute('INSERT OR IGNORE INTO chat_bans VALUES (?)',(row['user_id'],))
+        db.execute('UPDATE chat_messages SET hidden=1 WHERE user_id=?',(row['user_id'],))
+    return {'ok':True}
+
+@app.post('/api/admin/chat/unban/{username}')
+def unban_chat(username:str,user=Depends(current_user)):
+    owner(user)
+    with closing(connect()) as db,db:
+        db.execute('DELETE FROM chat_bans WHERE user_id IN (SELECT id FROM users WHERE username=?)',(username.strip().lower(),))
+    return {'ok':True}
+
+@app.post('/api/visit')
+def track_visit(request:Request,response:Response):
+    if request.headers.get('dnt')=='1' or request.headers.get('sec-gpc')=='1': return {'tracked':False}
+    token=request.cookies.get('tapin_visit','')
+    if not re.fullmatch('[a-f0-9]{32}',token):
+        token=secrets.token_hex(16)
+        response.set_cookie('tapin_visit',token,max_age=86400*30,httponly=True,secure=os.getenv('TAPIN_COOKIE_SECURE','1')!='0',samesite='strict')
+    day=time.strftime('%Y-%m-%d',time.gmtime())
+    visitor=hashlib.sha256((day+token).encode()).hexdigest()
+    with closing(connect()) as db,db:
+        db.execute('INSERT INTO visits(day,visitor,views) VALUES (?,?,1) ON CONFLICT(day,visitor) DO UPDATE SET views=views+1',(day,visitor))
+        db.execute("DELETE FROM visits WHERE day < date('now','-30 days')")
+    return {'tracked':True}
+
+@app.get('/api/admin/analytics')
+def analytics(user=Depends(current_user)):
+    owner(user)
+    with closing(connect()) as db:
+        rows=db.execute('SELECT day,COUNT(*) AS estimated_browsers,SUM(views) AS pageviews FROM visits GROUP BY day ORDER BY day DESC LIMIT 30').fetchall()
+        accounts=db.execute('SELECT COUNT(*) FROM users').fetchone()[0]
+        reviews=db.execute('SELECT COUNT(*) FROM clips WHERE review IS NOT NULL').fetchone()[0]
+    return {'days':[dict(r) for r in rows],'accounts':accounts,'saved_reviews':reviews}
